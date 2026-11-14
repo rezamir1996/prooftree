@@ -34,7 +34,7 @@ that anyone can read. Nothing about it travels through the model.
 The decision ladder
 -------------------
 1. Deterministic floor. A leaf may carry one literal keyword. A keyword found in the
-   folded evidence commits that leaf before any model runs, so a well-wordinged item does
+   folded evidence commits that leaf before any model runs, so a well-worded item does
    not depend on model recall at all.
 2. Model layer. The model reads the same evidence against the closed leaf vocabulary and
    may answer only with registered leaf codes, each with a verbatim quote.
