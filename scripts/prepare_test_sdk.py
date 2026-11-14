@@ -29,69 +29,66 @@ def archive_name(version: str) -> str:
     return f"genvm-universal-{version}.tar.xz"
 
 
-def cache_dir() -> Path:
-    return Path.home() / ".cache" / "gltest-direct"
+def find_linter() -> Path | None:
+    """Locate genvm-lint even when the virtual environment is not activated."""
+    suffix = ".exe" if os.name == "nt" else ""
+    beside_python = Path(sys.executable).parent / f"genvm-lint{suffix}"
+    if beside_python.is_file():
+        return beside_python
+    found = shutil.which("genvm-lint")
+    return Path(found) if found else None
 
 
-def linter_cache_dir() -> Path:
-    return Path.home() / ".cache" / "genvm-linter"
-
-
-def download_with_linter(version: str) -> Path:
-    """Ask genvm-lint to fetch the archive, then return the path it wrote."""
-    target = linter_cache_dir() / archive_name(version)
-    if target.exists():
-        return target
-
-    print(f"fetching {version} through genvm-lint")
-    result = subprocess.run(
-        ["genvm-lint", "download", "--version", version],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        sys.stderr.write(result.stdout)
-        sys.stderr.write(result.stderr)
-        raise SystemExit("genvm-lint download failed")
-    if not target.exists():
-        raise SystemExit(f"expected {target} after download")
-
-    return target
-
-
-def link_into_direct_cache(source: Path) -> Path:
-    destination = cache_dir() / source.name
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists() or destination.is_symlink():
-        destination.unlink()
-
-    try:
-        os.link(source, destination)
-        print(f"linked: {destination} -> {source}")
-    except OSError:
-        try:
-            destination.symlink_to(source)
-            print(f"symlinked: {destination} -> {source}")
-        except OSError:
-            shutil.copy2(source, destination)
-            print(f"copied: {destination} <- {source}")
-
-    return destination
-
-
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", default=DEFAULT_VERSION)
+    parser.add_argument("--version", default=DEFAULT_VERSION, help="GenVM release tag")
     args = parser.parse_args()
 
-    expected = cache_dir() / archive_name(args.version)
-    if expected.exists():
-        print(f"already in place: {expected}")
-        return
+    name = archive_name(args.version)
+    home = Path.home()
+    source = home / ".cache" / "genvm-linter" / name
+    target = home / ".cache" / "gltest-direct" / name
 
-    source = download_with_linter(args.version)
-    link_into_direct_cache(source)
+    if target.is_file() or target.is_symlink():
+        print(f"already prepared: {target}")
+        return 0
+
+    if not source.is_file():
+        tool = find_linter()
+        if tool is None:
+            print(
+                "genvm-lint was not found. Activate the virtual environment or run "
+                "`python -m pip install -r requirements-dev.txt` first.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"fetching {args.version} through {tool.name or tool}")
+        try:
+            subprocess.run([str(tool), "download", "-v", args.version], check=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print(f"could not download the GenVM archive: {exc}", file=sys.stderr)
+            return 1
+
+    if not source.is_file():
+        print(f"expected archive is missing: {source}", file=sys.stderr)
+        return 1
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    # A symlink avoids keeping a second copy of the archive. It is skipped on Windows,
+    # where symlink creation needs elevated privileges.
+    if os.name != "nt":
+        try:
+            target.symlink_to(source)
+            print(f"linked: {target} -> {source}")
+            return 0
+        except OSError:
+            pass
+
+    shutil.copy2(source, target)
+    print(f"copied: {target}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
