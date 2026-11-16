@@ -11,6 +11,23 @@ chain, and the tree is evaluated by code. What the model does is narrow by desig
 reports which registered leaves the evidence demonstrates, each backed by a span copied
 verbatim from the evidence. A leaf the model cannot point at is not a leaf.
 
+Versioned policy
+----------------
+A verdict is only meaningful against the tree it was computed on, so the tree is
+versioned and the version is part of the record:
+
+1. The owner edits an open version. Nodes are append-only and carry the version that
+   created them.
+2. `seal_policy()` closes that version and stores its canonical form, so the exact tree
+   behind every assessment is published and immutable.
+3. `assess()` refuses to run unless the current version is sealed, and stores the version
+   it was assessed under next to the verdict.
+4. `open_policy()` starts the next version. Earlier assessments keep their own version and
+   their own stored result.
+5. `is_eligible()` is true only for a stored `ELIGIBLE` under the latest sealed version.
+   Once the policy moves on, the gate fails closed and `is_stale()` says so, while
+   `verdict_of()` still reports what was decided and when.
+
 Why this needs an Intelligent Contract
 --------------------------------------
 Evidence arrives as prose. "We hold a SOC 2 Type II report covering the production
@@ -40,13 +57,22 @@ The decision ladder
    may answer only with registered leaf codes, each with a verbatim quote.
 3. Verification layer, deterministic. Code re-checks every quote against the folded text.
    A quote that is not in the text, a code outside the vocabulary, or a quote shorter
-   than three tokens makes the whole reading unusable.
+   than three tokens makes the whole reading unusable, and so does an answer longer than
+   the vocabulary allows. Answers are never truncated.
 4. Derivation, deterministic. The tree is evaluated against the agreed leaves. AND nodes
    need every child, OR nodes need any child, and an unsatisfied OR node reports the
    cheapest branch to satisfy rather than all of its children.
 
+Bounded shapes
+--------------
+The contract refuses to build a policy it could not read: `add_item` fails on the 41st
+leaf, so the leaf vocabulary is at most `MAX_LEAVES` (40) and an honest answer can never
+exceed it. A model that returns more than `MAX_REPORTED` (80) items, duplicates included,
+is treated as unusable rather than trimmed to fit.
+
 Consensus owns one value: the reading signal, `OK:<sorted leaf codes>` or `UNUSABLE`.
-Every stored field is re-derived from that signal plus the on-chain tree after agreement.
+Every stored field is re-derived from that signal plus the sealed tree of the version the
+assessment was bound to.
 """
 
 from genlayer import *
@@ -72,6 +98,7 @@ MODES = ("AND", "OR", "ITEM")
 
 MIN_QUOTE_TOKENS = 3
 MAX_LEAVES = 40
+MAX_REPORTED = 80
 MAX_NODES = 64
 MAX_TEXT = 2000
 MAX_LABEL = 80
@@ -126,15 +153,21 @@ class ProofTree(gl.Contract):
     node_mode: TreeMap[str, str]     # AND | OR | ITEM
     node_label: TreeMap[str, str]    # leaves only, shown to the model
     node_keyword: TreeMap[str, str]  # leaves only, folded, may be empty
+    node_added: TreeMap[str, u256]   # policy version that created the node
     node_index: str                  # registration order, comma joined
     nodes: u256
     root: str
+
+    policy_version: u256             # version being edited, or the last sealed one
+    policy_open: u256                # 1 while the current version accepts edits
+    version_tree: TreeMap[str, str]  # canonical sealed tree, keyed by version
 
     case_text: TreeMap[str, str]
     case_verdict: TreeMap[str, str]  # ELIGIBLE | MISSING | UNUSABLE
     case_met: TreeMap[str, str]      # sorted leaf codes demonstrated
     case_missing: TreeMap[str, str]  # sorted cheapest repair, may be empty
     case_counts: TreeMap[str, str]   # "<demonstrated>,<still needed>"
+    case_version: TreeMap[str, u256] # policy version the verdict was computed on
     cases: u256
 
     def __init__(self, site_label: str):
@@ -145,14 +178,18 @@ class ProofTree(gl.Contract):
         self.node_index = ""
         self.nodes = 0
         self.root = ""
+        self.policy_version = 1
+        self.policy_open = 1
         self.cases = 0
 
     # ------------------------------------------------------------------- policy
     @gl.public.write
     def add_group(self, code: str, parent: str, mode: str) -> None:
-        """Register an AND or OR node. `parent` is "" only for the single root."""
+        """Register an AND or OR node in the open policy version."""
         if gl.message.sender_address != self.owner:
             raise gl.vm.UserError("NOT_OWNER")
+        if int(self.policy_open) != 1:
+            raise gl.vm.UserError("POLICY_SEALED")
         if not _valid_key(code, 2, 24):
             raise gl.vm.UserError("BAD_CODE")
         if code in self.node_mode:
@@ -167,21 +204,30 @@ class ProofTree(gl.Contract):
         self.node_parent[code] = parent
         self.node_label[code] = ""
         self.node_keyword[code] = ""
+        self.node_added[code] = self.policy_version
         self._append(code)
         if parent == "":
             self.root = code
 
     @gl.public.write
     def add_item(self, code: str, parent: str, label: str, keyword: str) -> None:
-        """Register a leaf. `keyword` is optional and commits the leaf without a model."""
+        """Register a leaf in the open policy version.
+
+        The 41st leaf is refused rather than registered, because the reading step is
+        bounded at 40 leaves and a policy the contract cannot read must not exist.
+        """
         if gl.message.sender_address != self.owner:
             raise gl.vm.UserError("NOT_OWNER")
+        if int(self.policy_open) != 1:
+            raise gl.vm.UserError("POLICY_SEALED")
         if not _valid_key(code, 2, 24):
             raise gl.vm.UserError("BAD_CODE")
         if code in self.node_mode:
             raise gl.vm.UserError("NODE_EXISTS")
         if len(label) < 3 or len(label) > MAX_LABEL:
             raise gl.vm.UserError("BAD_LABEL")
+        if len(self._leaf_codes(int(self.policy_version))) >= MAX_LEAVES:
+            raise gl.vm.UserError("TOO_MANY_LEAVES")
         self._check_parent(parent)
         if int(self.nodes) >= MAX_NODES:
             raise gl.vm.UserError("TREE_FULL")
@@ -198,9 +244,40 @@ class ProofTree(gl.Contract):
         self.node_parent[code] = parent
         self.node_label[code] = label
         self.node_keyword[code] = folded
+        self.node_added[code] = self.policy_version
         self._append(code)
         if parent == "":
             self.root = code
+
+    @gl.public.write
+    def seal_policy(self) -> str:
+        """Close the open version and publish its canonical tree. Edits stop here."""
+        if gl.message.sender_address != self.owner:
+            raise gl.vm.UserError("NOT_OWNER")
+        if int(self.policy_open) != 1:
+            raise gl.vm.UserError("POLICY_SEALED")
+        version = int(self.policy_version)
+        if not self.root:
+            raise gl.vm.UserError("NO_TREE")
+        if not self._leaf_codes(version):
+            raise gl.vm.UserError("NO_ITEMS")
+        self._check_tree(version)
+
+        canonical = self._tree_string(version)
+        self.version_tree[str(version)] = canonical
+        self.policy_open = 0
+        return canonical
+
+    @gl.public.write
+    def open_policy(self) -> u256:
+        """Start the next policy version. Sealed versions are never edited again."""
+        if gl.message.sender_address != self.owner:
+            raise gl.vm.UserError("NOT_OWNER")
+        if int(self.policy_open) == 1:
+            raise gl.vm.UserError("POLICY_OPEN")
+        self.policy_version = self.policy_version + 1
+        self.policy_open = 1
+        return self.policy_version
 
     # -------------------------------------------------------------------- cases
     @gl.public.write
@@ -218,17 +295,21 @@ class ProofTree(gl.Contract):
 
     @gl.public.write
     def assess(self, case_id: str) -> str:
-        """Read the evidence, evaluate the tree, record the verdict. Once, immutably."""
+        """Read the evidence, evaluate the sealed tree, record the verdict once."""
+        if int(self.policy_open) != 0:
+            raise gl.vm.UserError("POLICY_NOT_SEALED")
         if case_id not in self.case_text:
             raise gl.vm.UserError("CASE_NOT_FOUND")
         if case_id in self.case_verdict:
             raise gl.vm.UserError("ALREADY_ASSESSED")
+
+        version = int(self.policy_version)
+        leaves = self._leaf_codes(version)
         if not self.root:
             raise gl.vm.UserError("NO_TREE")
-        leaves = self._leaf_codes()
         if not leaves:
             raise gl.vm.UserError("NO_ITEMS")
-        self._check_tree()
+        self._check_tree(version)
 
         folded = _normalize(self.case_text[case_id])
 
@@ -272,18 +353,20 @@ class ProofTree(gl.Contract):
             self.case_met[case_id] = ""
             self.case_missing[case_id] = ""
             self.case_counts[case_id] = "0,0"
+            self.case_version[case_id] = self.policy_version
             self.cases = self.cases + 1
             return "UNUSABLE"
 
         demonstrated = sorted(set(floor) | set(model_codes))
         available = set(demonstrated)
-        needed, missing = self._evaluate(self.root, available)
+        needed, missing = self._evaluate(self.root, available, version)
 
         verdict = "ELIGIBLE" if needed == 0 else "MISSING"
         self.case_verdict[case_id] = verdict
         self.case_met[case_id] = ",".join(demonstrated)
         self.case_missing[case_id] = ",".join(sorted(missing))
         self.case_counts[case_id] = str(len(demonstrated)) + "," + str(needed)
+        self.case_version[case_id] = self.policy_version
         self.cases = self.cases + 1
         return verdict
 
@@ -305,29 +388,52 @@ class ProofTree(gl.Contract):
         if mode != "AND" and mode != "OR":
             raise gl.vm.UserError("PARENT_NOT_GROUP")
 
-    def _leaf_codes(self) -> list:
+    def _in_version(self, code: str, version: int) -> bool:
+        return int(self.node_added[code]) <= version
+
+    def _version_codes(self, version: int) -> list:
         out = []
         for code in _split(self.node_index):
+            if self._in_version(code, version):
+                out.append(code)
+        return out
+
+    def _leaf_codes(self, version: int) -> list:
+        out = []
+        for code in self._version_codes(version):
             if self.node_mode[code] == "ITEM":
                 out.append(code)
         return sorted(out)
 
-    def _children(self, code: str) -> list:
+    def _children(self, code: str, version: int) -> list:
         out = []
-        for node in _split(self.node_index):
+        for node in self._version_codes(version):
             if self.node_parent[node] == code:
                 out.append(node)
         return out
 
-    def _check_tree(self) -> None:
-        """Every group must have children, and the root must be reachable downwards."""
-        for node in _split(self.node_index):
+    def _check_tree(self, version: int) -> None:
+        """Every group in this version must have at least one child in this version."""
+        for node in self._version_codes(version):
             mode = self.node_mode[node]
             if mode == "AND" or mode == "OR":
-                if not self._children(node):
+                if not self._children(node, version):
                     raise gl.vm.UserError("EMPTY_GROUP")
 
-    def _evaluate(self, code: str, available: set) -> tuple:
+    def _tree_string(self, version: int) -> str:
+        """Canonical, order-independent form of one policy version."""
+        out = []
+        for code in sorted(self._version_codes(version)):
+            out.append(
+                code
+                + ":"
+                + self.node_mode[code]
+                + ":"
+                + self.node_parent.get(code, "")
+            )
+        return "|".join(out)
+
+    def _evaluate(self, code: str, available: set, version: int) -> tuple:
         """Return (how many leaves are still needed, the cheapest set of them)."""
         mode = self.node_mode[code]
         if mode == "ITEM":
@@ -335,12 +441,12 @@ class ProofTree(gl.Contract):
                 return (0, [])
             return (1, [code])
 
-        children = self._children(code)
+        children = self._children(code, version)
         if mode == "AND":
             total = 0
             missing = []
             for child in children:
-                need, drop = self._evaluate(child, available)
+                need, drop = self._evaluate(child, available, version)
                 total = total + need
                 for item in drop:
                     missing.append(item)
@@ -349,7 +455,7 @@ class ProofTree(gl.Contract):
         # OR: satisfied if any child is; otherwise report the cheapest branch.
         best = None
         for child in children:
-            need, drop = self._evaluate(child, available)
+            need, drop = self._evaluate(child, available, version)
             if need == 0:
                 return (0, [])
             if best is None:
@@ -417,9 +523,12 @@ class ProofTree(gl.Contract):
                 items = raw.get("met")
             if not isinstance(items, list):
                 ok = False
+            elif len(items) > MAX_REPORTED:
+                # Never trim an answer to fit: an over-long answer is not a reading.
+                ok = False
             else:
                 seen = set()
-                for item in items[:MAX_LEAVES]:
+                for item in items:
                     code = self._read_item(item, allowed, folded_text)
                     if code == "":
                         dropped = dropped + 1
@@ -458,14 +567,36 @@ class ProofTree(gl.Contract):
     def is_eligible(self, case_id: str) -> bool:
         """The only boolean a downstream contract should read.
 
-        False means "do not rely on it": the tree is not satisfied, the reading was
-        unusable, or no assessment exists yet. The gate fails closed.
+        True means: this case was assessed `ELIGIBLE` under the latest sealed policy
+        version. False means: no assessment, an unusable reading, a gap, or a policy that
+        has moved on since. The gate fails closed on every one of those.
         """
-        return self.case_verdict.get(case_id, "") == "ELIGIBLE"
+        if self.case_verdict.get(case_id, "") != "ELIGIBLE":
+            return False
+        if case_id not in self.case_version:
+            return False
+        if int(self.case_version[case_id]) != self._latest_sealed():
+            return False
+        return True
+
+    @gl.public.view
+    def is_stale(self, case_id: str) -> bool:
+        """True when a later policy version has superseded this assessment."""
+        if case_id not in self.case_version:
+            return True
+        return int(self.case_version[case_id]) != self._latest_sealed()
 
     @gl.public.view
     def verdict_of(self, case_id: str) -> str:
+        """The stored verdict, whether or not the policy has moved on since."""
         return self.case_verdict.get(case_id, "")
+
+    @gl.public.view
+    def policy_version_of(self, case_id: str) -> u256:
+        """The sealed policy version this verdict was computed on."""
+        if case_id not in self.case_version:
+            return 0
+        return self.case_version[case_id]
 
     @gl.public.view
     def missing_of(self, case_id: str) -> str:
@@ -487,6 +618,27 @@ class ProofTree(gl.Contract):
         return self.case_text.get(case_id, "")
 
     @gl.public.view
+    def current_version(self) -> u256:
+        return self.policy_version
+
+    @gl.public.view
+    def is_open(self) -> bool:
+        return int(self.policy_open) == 1
+
+    @gl.public.view
+    def tree_of(self, version: u256) -> str:
+        """The canonical tree of a sealed version, "" if that version is not sealed."""
+        return self.version_tree.get(str(int(version)), "")
+
+    @gl.public.view
+    def tree(self) -> str:
+        """The canonical tree every new assessment would be bound to."""
+        sealed = self._latest_sealed()
+        if sealed == 0:
+            return ""
+        return self.version_tree.get(str(sealed), "")
+
+    @gl.public.view
     def node_mode_of(self, code: str) -> str:
         return self.node_mode.get(code, "")
 
@@ -497,6 +649,12 @@ class ProofTree(gl.Contract):
     @gl.public.view
     def node_keyword_of(self, code: str) -> str:
         return self.node_keyword.get(code, "")
+
+    @gl.public.view
+    def node_version_of(self, code: str) -> u256:
+        if code not in self.node_added:
+            return 0
+        return self.node_added[code]
 
     @gl.public.view
     def parent_of(self, code: str) -> str:
@@ -512,7 +670,7 @@ class ProofTree(gl.Contract):
 
     @gl.public.view
     def leaf_count(self) -> u256:
-        return len(self._leaf_codes())
+        return len(self._leaf_codes(int(self.policy_version)))
 
     @gl.public.view
     def case_count(self) -> u256:
@@ -524,11 +682,21 @@ class ProofTree(gl.Contract):
 
     @gl.public.view
     def config(self) -> str:
-        """Deployed parameters and the shape of the published tree."""
+        """Deployed parameters and the shape of the current policy version."""
         return (
             self.site_label
             + "|"
             + str(int(self.nodes))
             + "|"
-            + str(len(self._leaf_codes()))
+            + str(len(self._leaf_codes(int(self.policy_version))))
+            + "|v"
+            + str(int(self.policy_version))
+            + ("|open" if int(self.policy_open) == 1 else "|sealed")
         )
+
+    # ----------------------------------------------------------------- helpers
+    def _latest_sealed(self) -> int:
+        version = int(self.policy_version)
+        if int(self.policy_open) == 1:
+            return version - 1
+        return version
