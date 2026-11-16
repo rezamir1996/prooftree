@@ -26,7 +26,12 @@ versioned and the version is part of the record:
    their own stored result.
 5. `is_eligible()` is true only for a stored `ELIGIBLE` under the latest sealed version.
    Once the policy moves on, the gate fails closed and `is_stale()` says so, while
-   `verdict_of()` still reports what was decided and when.
+   `verdict_of()` still reports what was decided and under which version.
+6. Assessment records are per case and per version, and are never overwritten. Assessing
+   a case that was already assessed under an older version writes a new record, so a
+   vendor can be re-evaluated against a newer policy without losing the earlier result:
+   `verdict_at()` reads one version, `history_of()` lists them all, and `verdict_of()`
+   follows the newest.
 
 Why this needs an Intelligent Contract
 --------------------------------------
@@ -138,6 +143,11 @@ def _valid_key(value: str, min_len: int, max_len: int) -> bool:
     return True
 
 
+def _rec_key(case_id: str, version: int) -> str:
+    """Assessment records are keyed by case and version; "@" is not a valid code char."""
+    return case_id + "@v" + str(version)
+
+
 def _split(value: str) -> list:
     if not value:
         return []
@@ -162,13 +172,15 @@ class ProofTree(gl.Contract):
     policy_open: u256                # 1 while the current version accepts edits
     version_tree: TreeMap[str, str]  # canonical sealed tree, keyed by version
 
-    case_text: TreeMap[str, str]
-    case_verdict: TreeMap[str, str]  # ELIGIBLE | MISSING | UNUSABLE
-    case_met: TreeMap[str, str]      # sorted leaf codes demonstrated
-    case_missing: TreeMap[str, str]  # sorted cheapest repair, may be empty
-    case_counts: TreeMap[str, str]   # "<demonstrated>,<still needed>"
-    case_version: TreeMap[str, u256] # policy version the verdict was computed on
-    cases: u256
+    case_text: TreeMap[str, str]      # case id -> evidence, write once
+    rec_verdict: TreeMap[str, str]    # "case@vN" -> ELIGIBLE | MISSING | UNUSABLE
+    rec_met: TreeMap[str, str]        # "case@vN" -> sorted leaf codes demonstrated
+    rec_missing: TreeMap[str, str]    # "case@vN" -> sorted cheapest repair
+    rec_counts: TreeMap[str, str]     # "case@vN" -> "<demonstrated>,<still needed>"
+    case_latest: TreeMap[str, u256]   # case id -> version of its newest record
+    rec_version: TreeMap[str, u256]   # "case@vN" -> N, for the history listing
+    cases: u256                       # distinct case ids
+    assessments: u256                 # assessment records, one per case version
 
     def __init__(self, site_label: str):
         if len(site_label) < 3 or len(site_label) > 64:
@@ -181,6 +193,7 @@ class ProofTree(gl.Contract):
         self.policy_version = 1
         self.policy_open = 1
         self.cases = 0
+        self.assessments = 0
 
     # ------------------------------------------------------------------- policy
     @gl.public.write
@@ -300,10 +313,11 @@ class ProofTree(gl.Contract):
             raise gl.vm.UserError("POLICY_NOT_SEALED")
         if case_id not in self.case_text:
             raise gl.vm.UserError("CASE_NOT_FOUND")
-        if case_id in self.case_verdict:
-            raise gl.vm.UserError("ALREADY_ASSESSED")
 
         version = int(self.policy_version)
+        if _rec_key(case_id, version) in self.rec_verdict:
+            # One record per case per sealed version: no silent overwrite of history.
+            raise gl.vm.UserError("ALREADY_ASSESSED")
         leaves = self._leaf_codes(version)
         if not self.root:
             raise gl.vm.UserError("NO_TREE")
@@ -349,12 +363,7 @@ class ProofTree(gl.Contract):
 
         usable, model_codes = self._parse_signal(signal, leaves)
         if not usable:
-            self.case_verdict[case_id] = "UNUSABLE"
-            self.case_met[case_id] = ""
-            self.case_missing[case_id] = ""
-            self.case_counts[case_id] = "0,0"
-            self.case_version[case_id] = self.policy_version
-            self.cases = self.cases + 1
+            self._record(case_id, version, "UNUSABLE", "", "", "0,0")
             return "UNUSABLE"
 
         demonstrated = sorted(set(floor) | set(model_codes))
@@ -362,15 +371,44 @@ class ProofTree(gl.Contract):
         needed, missing = self._evaluate(self.root, available, version)
 
         verdict = "ELIGIBLE" if needed == 0 else "MISSING"
-        self.case_verdict[case_id] = verdict
-        self.case_met[case_id] = ",".join(demonstrated)
-        self.case_missing[case_id] = ",".join(sorted(missing))
-        self.case_counts[case_id] = str(len(demonstrated)) + "," + str(needed)
-        self.case_version[case_id] = self.policy_version
-        self.cases = self.cases + 1
+        self._record(
+            case_id,
+            version,
+            verdict,
+            ",".join(demonstrated),
+            ",".join(sorted(missing)),
+            str(len(demonstrated)) + "," + str(needed),
+        )
         return verdict
 
     # ---------------------------------------------------------------- internals
+    def _record(
+        self,
+        case_id: str,
+        version: int,
+        verdict: str,
+        met: str,
+        missing: str,
+        counts: str,
+    ) -> None:
+        """Append one assessment record. Records are never edited afterwards."""
+        rec = _rec_key(case_id, version)
+        self.rec_verdict[rec] = verdict
+        self.rec_met[rec] = met
+        self.rec_missing[rec] = missing
+        self.rec_counts[rec] = counts
+        self.rec_version[rec] = version
+        if case_id not in self.case_latest:
+            self.cases = self.cases + 1
+        self.case_latest[case_id] = version
+        self.assessments = self.assessments + 1
+
+    def _latest_record(self, case_id: str) -> str:
+        version = int(self.case_latest.get(case_id, 0))
+        if version == 0:
+            return ""
+        return _rec_key(case_id, version)
+
     def _append(self, code: str) -> None:
         index = _split(self.node_index)
         index.append(code)
@@ -571,47 +609,59 @@ class ProofTree(gl.Contract):
         version. False means: no assessment, an unusable reading, a gap, or a policy that
         has moved on since. The gate fails closed on every one of those.
         """
-        if self.case_verdict.get(case_id, "") != "ELIGIBLE":
+        rec = self._latest_record(case_id)
+        if rec == "" or self.rec_verdict.get(rec, "") != "ELIGIBLE":
             return False
-        if case_id not in self.case_version:
-            return False
-        if int(self.case_version[case_id]) != self._latest_sealed():
-            return False
-        return True
+        return int(self.case_latest.get(case_id, 0)) == self._latest_sealed()
 
     @gl.public.view
     def is_stale(self, case_id: str) -> bool:
-        """True when a later policy version has superseded this assessment."""
-        if case_id not in self.case_version:
+        """True when no assessment exists, or a later sealed version has superseded it."""
+        if case_id not in self.case_latest:
             return True
-        return int(self.case_version[case_id]) != self._latest_sealed()
+        return int(self.case_latest[case_id]) != self._latest_sealed()
 
     @gl.public.view
     def verdict_of(self, case_id: str) -> str:
-        """The stored verdict, whether or not the policy has moved on since."""
-        return self.case_verdict.get(case_id, "")
+        """The verdict of the newest assessment, whether or not it is still current."""
+        return self.rec_verdict.get(self._latest_record(case_id), "")
+
+    @gl.public.view
+    def verdict_at(self, case_id: str, version: u256) -> str:
+        """The verdict recorded for this case under one sealed version, "" if none."""
+        return self.rec_verdict.get(_rec_key(case_id, int(version)), "")
+
+    @gl.public.view
+    def history_of(self, case_id: str) -> str:
+        """Every assessment of this case, oldest first: `v1:ELIGIBLE|v2:MISSING`."""
+        out = []
+        for version in range(1, int(self.policy_version) + 1):
+            rec = _rec_key(case_id, version)
+            if rec in self.rec_verdict:
+                out.append("v" + str(version) + ":" + self.rec_verdict[rec])
+        return "|".join(out)
 
     @gl.public.view
     def policy_version_of(self, case_id: str) -> u256:
-        """The sealed policy version this verdict was computed on."""
-        if case_id not in self.case_version:
+        """The sealed policy version the newest assessment was computed on."""
+        if case_id not in self.case_latest:
             return 0
-        return self.case_version[case_id]
+        return self.case_latest[case_id]
 
     @gl.public.view
     def missing_of(self, case_id: str) -> str:
         """The cheapest set of leaves still needed. Empty when eligible."""
-        return self.case_missing.get(case_id, "")
+        return self.rec_missing.get(self._latest_record(case_id), "")
 
     @gl.public.view
     def met_of(self, case_id: str) -> str:
         """Leaves the evidence demonstrated, from either layer."""
-        return self.case_met.get(case_id, "")
+        return self.rec_met.get(self._latest_record(case_id), "")
 
     @gl.public.view
     def counts_of(self, case_id: str) -> str:
         """`"<demonstrated>,<still needed>"`: how far the evidence is from eligible."""
-        return self.case_counts.get(case_id, "")
+        return self.rec_counts.get(self._latest_record(case_id), "")
 
     @gl.public.view
     def text_of(self, case_id: str) -> str:
@@ -674,7 +724,13 @@ class ProofTree(gl.Contract):
 
     @gl.public.view
     def case_count(self) -> u256:
+        """Distinct case ids that have at least one assessment."""
         return self.cases
+
+    @gl.public.view
+    def assessment_count(self) -> u256:
+        """Assessment records written, one per case per sealed version."""
+        return self.assessments
 
     @gl.public.view
     def site_name(self) -> str:
