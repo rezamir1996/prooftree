@@ -413,6 +413,62 @@ def test_a_new_version_is_evaluated_with_the_leaves_it_contains(
     assert proof.is_eligible("v3") is False
 
 
+def test_an_older_assessment_can_be_refreshed_under_a_new_version(
+    direct_vm, direct_deploy
+):
+    """A policy change makes a verdict stale; it does not lock the case forever."""
+    proof = _policy(_proof(direct_deploy))
+    proof.register_case("r1", FULL)
+    direct_vm.mock_llm(PROMPT, _say(("soc2", SOC2_Q), ("dpa", DPA_Q)))
+    assert proof.assess("r1") == "ELIGIBLE"
+
+    proof.open_policy()
+    proof.add_item("pentest", "qualified", "an annual penetration test", "")
+    proof.seal_policy()
+    assert proof.is_eligible("r1") is False
+    assert proof.is_stale("r1") is True
+
+    # The evidence has not changed; the policy has. Re-read it against version 2.
+    assert proof.assess("r1") == "MISSING"
+    assert proof.verdict_of("r1") == "MISSING"
+    assert proof.policy_version_of("r1") == 2
+    assert proof.is_stale("r1") is False
+    assert proof.is_eligible("r1") is False
+
+    # Neither record is lost: version 1 still says what it said.
+    assert proof.verdict_at("r1", 1) == "ELIGIBLE"
+    assert proof.verdict_at("r1", 2) == "MISSING"
+    assert proof.history_of("r1") == "v1:ELIGIBLE|v2:MISSING"
+    assert proof.case_count() == 1
+    assert proof.assessment_count() == 2
+
+
+def test_a_refreshed_case_can_pass_again_once_the_gap_is_closed(
+    direct_vm, direct_deploy
+):
+    """Registering better evidence is still write-once: a new case id, a new record."""
+    proof = _policy(_proof(direct_deploy))
+    proof.register_case("r2", PARTIAL)
+    direct_vm.mock_llm(PROMPT, _say(("soc2", SOC2_Q)))
+    assert proof.assess("r2") == "MISSING"
+
+    # The first matching mock wins, so drop the soc2-only answer before re-reading.
+    direct_vm.clear_mocks()
+    proof.register_case("r3", FULL)
+    direct_vm.mock_llm(PROMPT, _say(("soc2", SOC2_Q), ("dpa", DPA_Q)))
+    assert proof.assess("r3") == "ELIGIBLE"
+    assert proof.verdict_at("r2", 1) == "MISSING"
+    assert proof.verdict_at("r3", 1) == "ELIGIBLE"
+    assert proof.case_count() == 2
+
+
+def test_history_of_an_unassessed_case_is_empty(direct_vm, direct_deploy):
+    proof = _policy(_proof(direct_deploy))
+    assert proof.history_of("never-assessed") == ""
+    assert proof.verdict_at("never-assessed", 1) == ""
+    assert proof.assessment_count() == 0
+
+
 def test_sealing_publishes_the_canonical_tree(direct_vm, direct_deploy):
     proof = _proof(direct_deploy)
     proof.add_group("root", "", "AND")
